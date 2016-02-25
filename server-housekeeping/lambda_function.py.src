@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+
+import logging, json
+import boto3, botocore
+
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger('botocore').setLevel(logging.WARN)
+
+
+REGION = '%%REGION%%' # region for global topic and provisioning table
+QUEUE_PREFIX = '%%PREFIX%%_'
+GLOBAL_TOPIC = '%%GLOBAL_TOPIC_ARN%%'
+TABLE_NAME = '%%TABLE_NAME%%'
+
+
+def lambda_handler(event, context):
+    handled = 0
+    records = event.get('Records', [])
+    for record in records:
+        if 'aws:sns' == record.get('EventSource') \
+           and 'Sns' in record \
+           and 'Notification' == record['Sns'].get('Type'):
+            region = record['EventSubscriptionArn'].split(':')[3]
+            msg = json.loads(record['Sns']['Message'])
+            if handle_message(msg, region, context):
+                handled += 1
+    logging.info('handled {}/{} records'.format(handled, len(records)))
+
+
+def handle_message(msg, region, context):
+    logging.info('handling sns notification: {}'.format(msg))
+    handlers = {'autoscaling:EC2_INSTANCE_LAUNCHING': handle_launch,
+                'autoscaling:EC2_INSTANCE_TERMINATING': handle_terminate}
+    t = msg.get('LifecycleTransition')
+    if t not in handlers:
+        logging.error('unknown lifecycle transition: {}'.format(t))
+    else:
+        instance_id = msg['EC2InstanceId']
+        if handlers[t](region, instance_id, context):
+            return complete_lifecycle(region, msg, context)
+
+
+
+def handle_launch(region, instance_id, context):
+    logging.info('{} launching in {}'.format(instance_id, region))
+
+    queue_arn = create_queue(region, instance_id, context)
+    sub_arn = subscribe_queue(queue_arn, GLOBAL_TOPIC, context)
+    logging.info('subscribed {} to {} ({})'.format(queue_arn, GLOBAL_TOPIC, sub_arn))
+
+    return record_instance(region, instance_id, sub_arn, context)
+
+
+def handle_terminate(region, instance_id, context):
+    logging.info('{} terminating in {}'.format(instance_id, region))
+
+    if context:
+        unsubscribe_queue(instance_id)
+        destroy_queue(region, instance_id)
+        unrecord_instance(instance_id)
+        return True
+
+
+def create_queue(region, instance_id, context):
+    # this policy allows the global topic to publish messages to the queue:
+    policy = { 'Version': '2012-10-17',
+               'Id': 'command-publish-policy',
+               'Statement': {
+                   'Sid': 'allow-command-publishing',
+                   'Effect': 'Allow',
+                   'Principal': '*',
+                   'Action': 'SQS:SendMessage',
+                   'Resource': '*',
+                   'Condition' : {
+                       'ArnEquals': {
+                           'aws:sourceArn': GLOBAL_TOPIC
+                       }
+                   }
+               }
+           }
+    queue_name = '{}{}'.format(QUEUE_PREFIX, instance_id)
+    params = {'QueueName': queue_name,
+              'Attributes': {'Policy': json.dumps(policy)}}
+    if not context:
+        logging.info('test mode, would have created queue using {}'.format(params))
+        return 'fake queue arn'
+
+    c = boto3.client('sqs', region_name=region)
+    queue_url = c.create_queue(**params)['QueueUrl']
+    logging.info('created {}'.format(queue_url))
+
+    result = c.get_queue_attributes(**{'QueueUrl': queue_url,
+                                       'AttributeNames': ['QueueArn']})
+    return result['Attributes']['QueueArn']
+
+
+def subscribe_queue(queue_arn, topic_arn, context):
+    if not queue_arn or not topic_arn:
+        logging.error("can't subscribe {} to {}".format(queue_arn, topic_arn))
+        return False
+    params = {'TopicArn': topic_arn,
+              'Protocol': 'sqs',
+              'Endpoint': queue_arn}
+    if not context:
+        logging.info('test mode, would have subscribed using {}'.format(params))
+        return 'fake subscription arn'
+    return boto3.client('sns', region_name=REGION) \
+                .subscribe(**params)['SubscriptionArn']
+
+
+def record_instance(region, instance_id, subscription_arn, context):
+    params = {
+        'Key': {'InstanceID': instance_id},
+        'UpdateExpression': 'SET #region = :region, #sub = :sub',
+        'ExpressionAttributeNames': {'#region': 'Region',
+                                     '#sub': 'Subscription'},
+        'ExpressionAttributeValues': {':region': region,
+                                      ':sub': subscription_arn}
+    }
+    if not context:
+        logging.info('test mode, would have recorded instance using {}'.format(params))
+        return False
+    return boto3.resource('dynamodb', region_name=REGION) \
+                .Table(TABLE_NAME) \
+                .update_item(**params)
+
+
+def unsubscribe_queue(instance_id):
+    params = {
+        'Key': {'InstanceID': instance_id},
+        'ProjectionExpression': '#sub',
+        'ExpressionAttributeNames': {'#sub': 'Subscription'}
+    }
+    result = boto3.resource('dynamodb', region_name=REGION) \
+                  .Table(TABLE_NAME) \
+                  .get_item(**params)
+    if result:
+        arn = result['Item']['Subscription']
+        boto3.client('sns', region_name=REGION) \
+             .unsubscribe(**{'SubscriptionArn': arn})
+        logging.info('unsubscribed {}'.format(arn))
+        return True
+    logging.info('no subscription for {} present in table'.format(instance_id))
+    return False
+
+
+def destroy_queue(region, instance_id):
+    c = boto3.client('sqs', region_name=region)
+    queue_name = '{}{}'.format(QUEUE_PREFIX, instance_id)
+    try:
+        queue_url = c.get_queue_url(**{'QueueName': queue_name})['QueueUrl']
+        c.delete_queue(**{'QueueUrl': queue_url})
+        logging.info('deleted queue {}'.format(queue_url))
+    except botocore.exceptions.ClientError as exc:
+        if 'queue does not exist' not in exc.message:
+            raise
+
+
+def unrecord_instance(instance_id):
+    params = {'Key': {'InstanceID': instance_id}}
+    boto3.resource('dynamodb', region_name=REGION) \
+         .Table(TABLE_NAME) \
+         .delete_item(**params)
+
+
+
+def complete_lifecycle(region, msg, context):
+    params = {k: msg[k]
+              for k in ['LifecycleHookName',
+                        'AutoScalingGroupName',
+                        'LifecycleActionToken']}
+    params['LifecycleActionResult'] = 'CONTINUE'
+    if not context:
+        logging.info('test mode, would have completed lifecycle action using {}'.format(params))
+        return False
+    return boto3.client('autoscaling', region_name=region) \
+                .complete_lifecycle_action(**params)
+
+
+if '__main__' == __name__:
+    launch_msg = {'LifecycleHookName': 'launch-hook',
+                  'AutoScalingGroupName': 'lambda-example-asg',
+                  'LifecycleActionToken': 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+                  'LifecycleTransition': 'autoscaling:EC2_INSTANCE_LAUNCHING',
+                  'EC2InstanceId': 'i-deadbeef'}
+    term_msg = dict(launch_msg,
+                    **{'LifecycleTransition': 'autoscaling:EC2_INSTANCE_TERMINATING',
+                       'LifecycleHookName': 'destroy-hook'})
+    examples = [{'Records': [{'EventSource': 'aws:sns',
+                              'EventSubscriptionArn':
+                              'arn:aws:sns:{}:ACCOUNT:TOPIC_NAME:SUBSCRIPTION_ID'.format(REGION),
+                              'Sns': {'Timestamp': '2016-02-20T01:11:34.270Z',
+                                      'Message': json.dumps(launch_msg),
+                                      'Type': 'Notification'}}]},
+                {'Records': [{'EventSource': 'aws:sns',
+                              'EventSubscriptionArn':
+                              'arn:aws:sns:{}:ACCOUNT:TOPIC_NAME:SUBSCRIPTION_ID'.format(REGION),
+                              'Sns': {'Timestamp': '2016-02-20T17:28:05.273Z',
+                                      'Message': json.dumps(term_msg),
+                                      'Type': 'Notification'}}]}]
+    for event in examples:
+        lambda_handler(event, None)

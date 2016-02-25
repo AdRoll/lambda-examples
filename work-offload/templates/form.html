@@ -1,0 +1,18 @@
+{% extends "layout.html" %}
+{% block body %}
+
+ <form>
+   URI to process: <input name="uri" type="text" value="{{ uri }}"><br>
+   <input type="submit">
+ </form>
+
+ <hr>
+  <div>
+   <p><b>last result:</b></p>
+
+   <pre>{{ result }}</pre>
+   
+  </div>
+
+  <p>processing time: {{ processing_time | round(2) }}s</p>
+{% endblock %}
