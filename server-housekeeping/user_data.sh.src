@@ -1,0 +1,58 @@
+#!/bin/sh
+# -*- mode: shell-script -*-
+yum install -y jq
+
+SCRIPT="/tmp/worker.sh"
+
+cat > $SCRIPT <<EOF
+#!/bin/sh -e
+PATH=$PATH:/usr/bin:/opt/aws/bin
+INSTANCE_ID=\$(ec2-metadata -i | awk '{print \$2}')
+REGION=\$(ec2-metadata -z | awk '{print \$2}' | rev | cut -c 2- | rev)
+QUEUE_URL=""
+LATEST="/tmp/latest_message.json"
+QUEUE_NAME="%%PREFIX%%_\${INSTANCE_ID}"
+BUCKET="%%BUCKET%%"
+BUCKET_PREFIX="%%BUCKET_PREFIX%%"
+
+while true; do
+    if [ -z "\$QUEUE_URL" ]; then
+        QUEUE_URL=\$(aws sqs get-queue-url --region \$REGION \\
+                     --queue-name "\$QUEUE_NAME" --output text || true)
+        if [ -z "\$QUEUE_URL" ]; then
+            echo "no queue for this instance yet, sleeping..."
+            sleep 30
+            continue
+        else
+            echo "got queue url: \$QUEUE_URL"
+        fi
+    fi
+    aws sqs receive-message --region \$REGION \\
+      --queue-url "\$QUEUE_URL" \\
+      --max-number-of-messages 1 \\
+      --visibility-timeout 30 \\
+      --wait-time-seconds 20 > \$LATEST
+    HANDLE=\$(jq -r '.Messages[0].ReceiptHandle' < \$LATEST)
+    MESSAGE=\$(jq -r '.Messages[0].Body' < \$LATEST)
+    if [ -z "\$HANDLE" ]; then
+        echo "no messages yet..."
+        continue
+    fi
+    echo "got message: [\${MESSAGE}]"
+    aws sqs delete-message --region \$REGION \\
+      --queue-url "\$QUEUE_URL" \\
+      --receipt-handle "\$HANDLE"
+    if [ "\$MESSAGE" = "poweroff" ]; then
+        echo "got shutdown signal."
+        poweroff
+    else
+        DATE=\$(date -u +'%Y-%m-%d')
+        EPOCH=\$(date -u +'%s')
+        KEY_URI="s3://\$BUCKET/\${BUCKET_PREFIX}\$DATE/\${INSTANCE_ID}_\${EPOCH}.log"
+        echo "did some work on [\$MESSAGE]" | aws s3 cp - "\$KEY_URI"
+        echo "uploaded log to \$KEY_URI"
+    fi
+done
+EOF
+chmod 0755 $SCRIPT
+$SCRIPT > /tmp/worker.log 2>&1 &
